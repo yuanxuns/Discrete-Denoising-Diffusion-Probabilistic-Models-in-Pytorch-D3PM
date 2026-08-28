@@ -7,6 +7,14 @@ from loguru import logger
 from torch import nn
 from torch.nn import functional as F
 
+from models.d3pm_utils import (
+    categorical_kl_logits,
+    categorical_kl_probs,
+    categorical_log_likelihood,
+    gumbel_argmax,
+    log_min_exp,
+    meanflat,
+)
 from models.transition_matrices import compute_transition_matrices
 
 
@@ -19,6 +27,7 @@ class D3PM(nn.Module):
     q_mats: torch.Tensor
     q_bar_mats: torch.Tensor
     q_T_mats: torch.Tensor
+    bin_centers: torch.Tensor
 
     def __init__(
         self,
@@ -32,7 +41,7 @@ class D3PM(nn.Module):
         hybrid_coeff,
         K,
         mask_id=None,
-        eps=1.0e-5,
+        eps=1.0e-6,
     ):
         super().__init__()
         self.betas = betas
@@ -87,6 +96,10 @@ class D3PM(nn.Module):
             self.num_timesteps,
             self.K,
             self.K,
+        )
+
+        self.register_buffer(
+            "bin_centers", torch.linspace(-1.0, 1.0, self.K), persistent=False
         )
 
     def register(self, name, tensor):
@@ -148,3 +161,559 @@ class D3PM(nn.Module):
             "t_saturate": t_saturate,
             "frac_useful": frac_useful,
         }
+
+    def _at(self, a, t, x):
+        """
+        a: (num_timesteps, K, K)
+        t: (batch_size,)
+        x: (batch_size, ...)
+        """
+
+        batch_size = x.shape[0]
+        a_t = torch.index_select(a, dim=0, index=t)
+        assert a_t.shape == (batch_size, self.K, self.K)
+
+        # idx: (batch_size, N) -> (batch_size, N, 1) -> (batch_size, N, K)
+        idx = (
+            x.reshape(batch_size, -1)
+            .to(torch.int64)
+            .unsqueeze(-1)
+            .expand(-1, -1, self.K)
+        )
+        # out: (batch_size, N, K)
+        # out[b, n, k] = a_t[b, x[b, n], k]
+        out = torch.gather(a_t, dim=1, index=idx)
+
+        return out.reshape(*x.shape, self.K)
+
+    def _at_onehot(self, a, t, x):
+        """
+        a: (num_timesteps, K, K)
+        t: (batch_size,)
+        x: (batch_size, ..., K)
+        """
+
+        batch_size = x.shape[0]
+        a_t = torch.index_select(a, dim=0, index=t)
+        assert a_t.shape == (batch_size, self.K, self.K)
+
+        # out: (batch_size, ..., K)
+        out = torch.matmul(x.reshape(batch_size, -1, self.K), a_t)
+
+        return out.reshape(x.shape[:-1])
+
+    def sample_timesteps(self, bs, device):
+        """
+        Uniformly sample timesteps from 0 to num_timesteps-1 for a batch of size bs.
+        """
+        return torch.randint(
+            low=0, high=self.num_timesteps, size=(bs,), device=device
+        )
+
+    def to_internal_t(self, frac, bs, device):
+        """
+        Convert a fraction in [0, 1] to an internal timestep in [0, num_timesteps-1].
+        """
+        idx = torch.floor(frac * self.num_timesteps).to(torch.int64)
+        idx = torch.clamp(idx, min=0, max=self.num_timesteps - 1)
+        return idx.expand(bs).to(device)
+
+    def q_probs(self, x_start, t):
+        """
+        Compute q(x_t | x_start) for a batch of x_start and t.
+        Inputs:
+            x_start: (batch_size, ...)
+            t: (batch_size,)
+        Returns: (batch_size, ..., K)
+        """
+        return self._at(self.q_bar_mats, t, x_start)
+
+    def q_sample(self, x_start, t, noise):
+        """
+        Sample from q(x_t | x_start) for a batch of x_start and t. Add noise to the data.
+        Inputs:
+            x_start: (batch_size, ...)
+            t: (batch_size,)
+            noise: (batch_size, ..., K), where each noise element is a independent uniform random variable in [0, 1].
+        Returns: (batch_size, ...)
+        """
+        assert noise.shape == (*x_start.shape, self.K)
+
+        logits = torch.log(self.q_probs(x_start, t) + self.eps)
+        noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.0)
+        gumbel_noise = -torch.log(-torch.log(noise))
+        return torch.argmax(logits + gumbel_noise, dim=-1)
+
+    def _get_logits_from_logistic_pars(self, loc, log_scale):
+        """
+        Convert logistic distribution parameters to logits.
+        Inputs:
+            loc: (batch_size, ...)
+            log_scale: (batch_size, ...)
+        Returns: (batch_size, ..., K)
+        """
+
+        # (batch_size, ...) -> (batch_size, ..., 1)
+        loc = torch.unsqueeze(loc, dim=-1)
+        log_scale = torch.unsqueeze(log_scale, dim=-1)
+
+        inv_scale = torch.exp(-log_scale + 2.0)
+        bin_width = 2.0 / (self.K - 1.0)
+        # (K) -> (1, ..., K)
+        bin_centers = self.bin_centers.view(*([1] * (len(loc.shape) - 1)), -1)
+
+        bin_centers = bin_centers - loc
+        log_cdf_minus = F.logsigmoid(
+            (bin_centers - bin_width / 2.0) * inv_scale
+        )
+        log_cdf_plus = F.logsigmoid((bin_centers + bin_width / 2.0) * inv_scale)
+
+        logits = log_min_exp(log_cdf_plus, log_cdf_minus, eps=self.eps)
+        return logits
+
+    def q_posterior_logits(self, x_start, x_t, t, is_x_start_logits):
+        """
+        Compute the logits of q(x_{t-1} | x_t, x_start) for a batch of x_start, x_t, and t.
+        Inputs:
+            x_start: (batch_size, ...) or (batch_size, ..., K) if is_x_start_logits is True
+            x_t: (batch_size, ...)
+            t: (batch_size,)
+            is_x_start_logits: bool, whether x_start is in logits space or not.
+        Returns: (batch_size, ..., K)
+        """
+
+        if is_x_start_logits:
+            assert x_start.shape == (*x_t.shape, self.K)
+        else:
+            assert x_start.shape == x_t.shape
+
+        # fact1[..., v] = q(x_t|x_(t-1)=v) = q_mats[t][v, x_t]
+        fact1 = self._at(self.q_T_mats, t, x_t)
+
+        if is_x_start_logits:
+            t_minus_one = torch.clamp(t - 1, min=0)
+            # fact2[..., v] = q(x_(t-1)=v|x_start)
+            #               = x_start * q_bar_mats[t-1][x_start, v]
+            fact2 = self._at_onehot(
+                self.q_bar_mats, t_minus_one, F.softmax(x_start, dim=-1)
+            )
+            # p(x_start|x_0, x_start)
+            tzero_logits = x_start
+        else:
+            t_minus_one = torch.clamp(t - 1, min=0)
+            # fact2[..., v] = q(x_(t-1)=v|x_start)
+            #               = x_start * q_bar_mats[t-1][x_start, v]
+            fact2 = self._at(self.q_bar_mats, t_minus_one, x_start)
+            # p(x_start|x_0, x_start)
+            tzero_logits = torch.log(
+                F.one_hot(x_start.to(torch.int64), num_classes=self.K)
+                + self.eps
+            )
+
+        out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
+
+        t_broadcast = torch.reshape(
+            t, ([out.shape[0]] + [1] * (len(out.shape) - 1))
+        )
+        return torch.where(t_broadcast == 0, tzero_logits, out)
+
+    def model_x_start_logits(self, model, x, t):
+        assert t.shape == (x.shape[0],)
+
+        model_output = model(x, t)
+        if self.logits_type == "logits":
+            return model_output
+        elif self.logits_type == "logistic_pars":
+            loc, log_scale = model_output
+            return self._get_logits_from_logistic_pars(loc, log_scale)
+        else:
+            raise ValueError(
+                f"Unknown logits_type: {self.logits_type}. Must be 'logits' or 'logistic_pars'."
+            )
+
+    def p_logits(self, model, *, x, t):
+        """
+        Compute the logits of p_(theta)(x_{t-1} | x_t) for a batch of x and t.
+        Inputs:
+            model: the model to compute p(x_{t-1} | x_t)
+            x: (batch_size, ...)
+            t: (batch_size,)
+        Returns: (batch_size, ..., K)
+        """
+        model_logits = self.model_x_start_logits(model, x, t)
+
+        if self.model_prediction_type == "x_start":
+            pred_x_start_logits = model_logits
+            t_broadcast = torch.reshape(
+                t,
+                ([model_logits.shape[0]] + [1] * (len(model_logits.shape) - 1)),
+            )
+            model_logits = torch.where(
+                t_broadcast == 0,
+                pred_x_start_logits,
+                self.q_posterior_logits(
+                    x_start=pred_x_start_logits,
+                    x_t=x,
+                    t=t,
+                    is_x_start_logits=True,
+                ),
+            )
+        elif self.model_prediction_type == "x_prev":
+            raise NotImplementedError(
+                "model_prediction_type='x_prev' is not implemented yet."
+            )
+        else:
+            raise ValueError(
+                f"Unknown model_prediction_type: {self.model_prediction_type}. Must be 'x_start' or 'x_prev'."
+            )
+
+        assert (
+            model_logits.shape
+            == (*x.shape, self.K)
+            == pred_x_start_logits.shape
+        )
+
+        return model_logits, pred_x_start_logits
+
+    def cum_transition_matrix(self, s, t):
+        """
+        Compute the cumulative transition matrix from timestep s to timestep t.
+        q(x_t | x_s) = Q_(s+1) @ Q_(s+2) @ ... @ Q_t
+                     = Q_bar_t @ Q_bar_s^{-1}
+        """
+        assert -1 <= s < t < self.num_timesteps, (
+            f"Invalid timesteps: s={s}, t={t}, num_timesteps={self.num_timesteps}"
+        )
+
+        if s < 0:
+            return self.q_bar_mats[t]
+
+        mat = self.q_mats[s + 1]
+        for k in range(s + 2, t + 1):
+            mat = mat @ self.q_mats[k]
+        return mat
+
+    def q_posterior_logits_strided(self, x_start_logits, x_t, t, s):
+        """
+        Compute the logits of q(x_s | x_t, x_start) for an arbitrary jump s < t.
+        q(x_s | x_t, x_start) = q(x_s, x_t, | x_start) / q(x_t | x_start)
+                = q(x_t | x_s, x_start) * q(x_s | x_start) / q(x_t | x_start)
+                = q(x_t | x_s) * q(x_s | x_start) / q(x_t | x_start)
+                \propto q(x_t | x_s) * q(x_s | x_start)
+                = Q_(s->t) (x_s, x_t) * QBar_s (x_start, x_s)
+        """
+        assert -1 <= s < t < self.num_timesteps, (
+            f"Invalid timesteps: s={s}, t={t}, num_timesteps={self.num_timesteps}"
+        )
+
+        if s < 0:
+            return x_start_logits
+        # q(x_t | x_s)
+        q_st = self.cum_transition_matrix(s, t)
+        # fact1[..., v] = q(x_t | x_s = v), select x_t-th column of q_st
+        fact1 = q_st.t().continuous()[x_t.to(torch.int64)]
+        # fact2[..., v] = sum_(x_start) p(x_start) * q(x_s = v| x_start)
+        fact2 = torch.matmul(
+            F.softmax(x_start_logits, dim=-1), self.q_bar_mats[s]
+        )
+        return torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
+
+    # ====== Sampling ======
+
+    def prior_sample(self, shape, device):
+        """
+        Draw x_T from the stationary distribution of the forward process.
+        """
+
+        if self.transition_matrix_type in ["gaussian", "uniform"]:
+            return torch.randint(
+                low=0,
+                high=self.num_timesteps,
+                size=shape,
+                dtype=torch.int64,
+                device=device,
+            )
+        elif self.transition_matrix_type == "absorbing":
+            return torch.full(
+                shape, self.mask_id, dtype=torch.int64, device=device
+            )
+        else:
+            raise ValueError("Undefined transition matrix type")
+
+    def forward_jump(self, x_s, s, t):
+        """
+        Inputs:
+          x_s: (batch_size, ...) integer state at time s
+        """
+        assert s < t
+        mat = self.q_bar_mats[t] if s < 0 else self.cum_transition_matrix(s, t)
+        # (batch_size, ..., K)
+        probs = mat[x_s.to(torch.int64)]
+        # # (batch_size, ...)
+        return gumbel_argmax(torch.log(probs + self.eps))
+
+    @torch.no_grad()
+    def p_sample(self, model, *, x, t, noise):
+        """
+        Sample one step from the model p(x_(t-1) | x_t).
+
+        x_t -> model -> p(x_start | x_t) -> p(x_(t-1) | x_t) -> sample x_(t-1)
+
+        Inputs:
+          x: (bs, ...)
+          t: (bs)
+          noise: (bs, ..., K) in U[0, 1] for Gumbel-max
+        Outputs:
+          sample: (bs, ...)
+          pred_x_start_probs: (bs, ..., K)
+        """
+
+        model_logits, pred_x_start_logits = self.p_logits(model=model, x=x, t=1)
+        assert noise.shape == model_logits.shape
+
+        # (bs) -> (bs, 1, ..., 1), dim = (1 + len(x.shape))
+        nonzero_mask = (
+            (t != 0).to(x.dtype).reshape(x.shape[0], *([1] * (len(x.shape))))
+        )
+
+        noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.0)
+
+        gumbel_noise = -torch.log(-torch.log(noise))
+        sample = torch.argmax(
+            model_logits + nonzero_mask * gumbel_noise, dim=-1
+        )
+        assert sample.shape == x.shape
+        assert pred_x_start_logits.shape == model_logits.shape
+
+        return sample, F.softmax(pred_x_start_logits, dim=-1)
+
+    @torch.no_grad()
+    def p_sample_loop(self, model, shape, num_timesteps=None, return_x_T=False):
+        device = next(model.parameters()).device
+        noise_shape = tuple(shape) + (self.K,)
+        x_T = self.prior_sample(tuple(shape), device)
+        if num_timesteps is None:
+            num_timesteps = self.num_timesteps
+
+        x = x_T
+        for i in reversed(range(0, num_timesteps)):
+            t = torch.full((shape[0],), i, dtype=torch.int64).to(device)
+            x, _ = self.p_sample(
+                model=model,
+                x=x,
+                t=t,
+                noise=torch.rand(size=noise_shape).to(x.device),
+            )
+
+        assert x.shape == shape
+
+        if return_x_T:
+            return x_T, x
+        else:
+            return x
+
+    @torch.no_grad()
+    def p_sample_loop_strided(
+        self,
+        model,
+        shape,
+        num_steps=None,
+        device=None,
+        greedy_final=True,
+        return_intermediates=False,
+        resample_r=1,
+        resample_jump=1.0,
+    ):
+        if device is None:
+            device = next(model.parameters()).device
+
+        if num_steps is None:
+            num_steps = self.num_timesteps
+
+        num_steps = max(1, min(int(num_steps), self.num_timesteps))
+        repeats = max(1, int(resample_r))
+
+        ts = np.linspace(self.num_timesteps - 1, -1, num_steps + 1)
+        ts = np.unique(np.round(ts).astype(int))[::-1]
+
+        x = self.prior_sample(shape, device)
+        intermediates = [x]
+        nfe = 0
+        for i in range(len(ts) - 1):
+            t_cur, t_next = int(ts[i]), int(ts[i + 1])
+            t_now = t_cur
+            for r in range(repeats):
+                t_batch = torch.full(
+                    (shape[0],), t_now, dtype=torch.int64, device=device
+                )
+                pred_x_start_logits = self.model_x_start_logits(
+                    model, x, t_batch
+                )
+                nfe += 1
+                # q(x_tnext | x_tnow, x_start)
+                logits = self.q_posterior_logits_strided(
+                    pred_x_start_logits, x, t_now, t_next
+                )
+                if t_next < 0 and greedy_final:
+                    x_next = torch.argmax(logits, dim=-1)
+                else:
+                    x_next = gumbel_argmax(logits)
+
+                span = max(1, round(resample_jump * (t_now - t_next)))
+                t_back = min(t_cur, t_next + span)
+
+                if r == repeats - 1 or t_next < 0 or t_back <= t_next:
+                    x = x_next
+                    break
+
+                x = self.forward_jump(x_next, t_next, t_back)
+                t_now = t_back
+
+            intermediates.append(x)
+
+        self.last_nfe = nfe
+        assert x.shape == shape
+        return (x, intermediates) if return_intermediates else x
+
+    # ====== Log Likelihood / Loss Calculation ======
+    def vb_terms_bpd(self, model, *, x_start, x_t, t):
+        """Calculate specified terms of the variational bound.
+
+        Args:
+          model: the denoising network
+          x_start: original clean data
+          x_t: noisy data
+          t: timestep of the noisy data (and the corresponding term of the bound
+            to return)
+
+        Returns:
+          a pair `(kl, pred_start_logits)`, where `kl` are the requested bound terms
+          (specified by `t`), and `pred_x_start_logits` is logits of
+          the denoised image.
+        """
+        # The logits of q(x_{t-1} | x_t, x_start)
+        true_logits = self.q_posterior_logits(
+            x_start, x_t, t, x_start_logits=False
+        )
+        # The logits of p_(theta)(x_{t-1} | x_t)
+        model_logits, pred_x_start_logits = self.p_logits(model, x=x_t, t=t)
+
+        kl = categorical_kl_logits(logits1=true_logits, logits2=model_logits)
+        assert kl.shape == x_start.shape
+        kl = meanflat(kl) / np.log(2.0)
+
+        decoder_nll = -categorical_log_likelihood(x_start, model_logits)
+        assert decoder_nll.shape == x_start.shape
+        decoder_nll = meanflat(decoder_nll) / np.log(2.0)
+
+        # At the first timestep return the decoder NLL,
+        # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
+        assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
+        return torch.where(t == 0, decoder_nll, kl), pred_x_start_logits
+
+    def prior_bpd(self, x_start):
+        """
+        Computes KL(q(x_(T-1) | x0) || p(x_(T-1)))
+        """
+
+        q_probs = self.q_probs(
+            x_start=x_start,
+            t=torch.full(
+                (x_start.shape[0],),
+                self.num_timesteps - 1,
+                dtype=torch.int64,
+                device=x_start.device,
+            ),
+        )
+
+        if self.transition_matrix_type in ["gaussian", "uniform"]:
+            prior_probs = torch.ones_like(q_probs) / self.K
+        elif self.transition_matrix_type == "absorbing":
+            absorbing_int = torch.full(
+                q_probs.shape[:-1],
+                self.mask_id,
+                dtype=torch.int64,
+                device=q_probs.device,
+            )
+            prior_probs = F.one_hot(absorbing_int, num_classes=self.K).to(
+                q_probs.dtype
+            )
+        else:
+            raise ValueError("Undefined transition matrix type")
+
+        assert prior_probs.shape == q_probs.shape
+        kl_prior = categorical_kl_probs(q_probs, prior_probs)
+        assert kl_prior.shape == x_start.shape
+        return meanflat(kl_prior) / np.log(2.0)
+
+    def cross_entropy_x_start(self, x_start, pred_x_start_logits):
+        """
+        Negative log-likelihood of the true class == cross entropy.
+        Because the target is one hot, - sum_k q_k*log(p_k)
+                                    => - log p_theta(x_start)
+        """
+        ce = -categorical_log_likelihood(x_start, pred_x_start_logits)
+        ce = meanflat(ce) / np.log(2.0)
+        return ce
+
+    def training_losses(self, model, x_start, t):
+        noise = torch.rand(
+            size=x_start.shape + (self.K,), device=x_start.device
+        )
+
+        # t starts at 0
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        if self.loss_type == "kl":
+            losses, _ = self.vb_terms_bpd(
+                model=model, x_start=x_start, x_t=x_t, t=t
+            )
+
+        elif self.loss_type == "cross_entropy_x_start":
+            _, pred_x_start_logtits = self.p_logits(model=model, x_t=x_t, t=t)
+            losses = self.cross_entropy_x_start(
+                x_start=x_start, pred_x_start_logits=pred_x_start_logtits
+            )
+        elif self.loss_type == "hybrid":
+            vb_losses, pred_x_start_logtits = self.vb_terms_bpd(
+                model=model, x_start=x_start, x_t=x_t, t=t
+            )
+            ce_losses = self.cross_entropy_x_start(
+                x_start=x_start, pred_x_start_logits=pred_x_start_logtits
+            )
+            losses = vb_losses + self.hybrid_coeff * ce_losses
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        assert losses.shape == t.shape
+        return losses
+
+    @torch.no_grad()
+    def calc_bpd_loop(self, model, x_start):
+        batch_size = x_start.shape[0]
+        noise_shape = x_start.shape + (self.K,)
+        vbterms = []
+
+        for t in reversed(range(self.num_timesteps)):
+            t_b = torch.full(
+                (batch_size,), t, dtype=torch.int64, device=x_start.device
+            )
+            vb, _ = self.vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                t=t_b,
+                x_t=self.q_sample(
+                    x_start=x_start,
+                    t=t_b,
+                    noise=torch.rand(size=noise_shape, device=x_start.device),
+                ),
+            )
+            vbterms.append(vb)
+
+        vbterms_tb = torch.stack(vbterms, dim=0)
+        vbterms_bt = vbterms_tb.T
+        assert vbterms_bt.shape == (batch_size, self.num_timesteps)
+
+        prior_b = self.prior_bpd(x_start=x_start)
+        total_b = vbterms_tb.sum(dim=0) + prior_b
+        return {"total": total_b, "vbterms": vbterms_bt, "prior": prior_b}
