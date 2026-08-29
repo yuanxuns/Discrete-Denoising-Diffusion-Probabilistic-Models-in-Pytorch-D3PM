@@ -44,3 +44,11 @@ def test_p_sample_uses_provided_timestep():
     d3pm.p_sample(model=None, x=x, t=t, noise=noise)
 
     assert torch.equal(seen["t"], t)
+
+
+def test_schedule_diagnostics_returns_scalar_metrics():
+    diagnostics = make_model().schedule_diagonostics()
+
+    assert isinstance(diagnostics["mixing_error"], float)
+    assert 0 <= diagnostics["t_saturate"] <= 5
+    assert 0.0 <= diagnostics["frac_useful"] <= 1.0

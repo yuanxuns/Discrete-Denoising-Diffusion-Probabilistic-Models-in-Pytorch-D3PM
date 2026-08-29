@@ -131,7 +131,9 @@ class D3PM(nn.Module):
         self, sat_tol=0.01, mix_error_tol=5e-3, frac_tol=0.6, log_warn=False
     ):
         prior = self.prior_distribution()
-        mixing_error = float(self.q_bar_mats[-1] - prior[None, :]).abs().max()
+        mixing_error = float(
+            (self.q_bar_mats[-1] - prior[None, :]).abs().max()
+        )
         per_row_total_variation = (
             0.5
             * (self.q_bar_mats - prior[None, None, :])
