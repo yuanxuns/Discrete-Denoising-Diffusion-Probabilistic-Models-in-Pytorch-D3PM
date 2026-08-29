@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import utils
 from loguru import logger
 from torch import nn
 from torch.nn import functional as F
@@ -44,7 +43,6 @@ class D3PM(nn.Module):
         eps=1.0e-6,
     ):
         super().__init__()
-        self.betas = betas
         self.num_timesteps = len(betas)
         # "x_start", or "x_prev"
         self.model_prediction_type = model_prediction_type
@@ -64,7 +62,8 @@ class D3PM(nn.Module):
 
         self.register("betas", betas)
 
-        # Precompute the transition matrices and their products.
+        # Register and dimension update for the forward transition kernels.
+        # q_mats: (T, K, K), where T = num_timesteps, K = number of states.
         q_mats = compute_transition_matrices(
             betas=betas,
             transition_matrix_type=self.transition_matrix_type,
@@ -79,10 +78,12 @@ class D3PM(nn.Module):
             self.K,
         )
 
+        # q_bar_mats: cumulative transition from x_0 to x_t, shape (T, K, K).
         q_bar_mat_t = self.q_mats[0]
         q_bar_mats = [q_bar_mat_t]
         for t in range(1, self.num_timesteps):
-            q_bar_mat_t = torch.matmul(self.q_mats[t], q_bar_mats[-1])
+            # Row-vector convention: q(x_t | x_start) = Q_0 ... Q_t.
+            q_bar_mat_t = torch.matmul(q_bar_mats[-1], self.q_mats[t])
             q_bar_mats.append(q_bar_mat_t)
         self.register("q_bar_mats", torch.stack(q_bar_mats, dim=0))
         assert self.q_bar_mats.shape == (
@@ -91,6 +92,7 @@ class D3PM(nn.Module):
             self.K,
         )
 
+        # q_T_mats: transposed kernels for efficient sampling from q(x_t | x_{t-1}), shape (T, K, K).
         self.register("q_T_mats", torch.transpose(self.q_mats, 1, 2))
         assert self.q_T_mats.shape == (
             self.num_timesteps,
@@ -164,9 +166,16 @@ class D3PM(nn.Module):
 
     def _at(self, a, t, x):
         """
-        a: (num_timesteps, K, K)
-        t: (batch_size,)
-        x: (batch_size, ...)
+        Select row-wise transition probabilities for each batch sample at time index t.
+
+        Args:
+            a: Tensor of shape (T, K, K), representing the transition matrices.
+            t: Integer timestep tensor of shape (batch_size,).
+            x: State tensor of shape (batch_size, ...), where each entry is in [0, K-1].
+
+        Returns:
+            Tensor of shape (batch_size, ..., K), where the last dimension stores the
+            conditional distribution over the next state for each sample.
         """
 
         batch_size = x.shape[0]
@@ -188,9 +197,17 @@ class D3PM(nn.Module):
 
     def _at_onehot(self, a, t, x):
         """
-        a: (num_timesteps, K, K)
-        t: (batch_size,)
-        x: (batch_size, ..., K)
+        Apply the selected transition matrices to a one-hot-like batch tensor.
+
+        Args:
+            a: Tensor of shape (T, K, K), representing transition matrices.
+            t: Integer timestep tensor of shape (batch_size,).
+            x: Tensor of shape (batch_size, ..., K), where the last dimension is a
+                categorical probability vector or one-hot-like soft assignment.
+
+        Returns:
+            Tensor of shape (batch_size, ..., K), obtained by multiplying each distributed
+            state representation by the selected transition matrix.
         """
 
         batch_size = x.shape[0]
@@ -200,11 +217,18 @@ class D3PM(nn.Module):
         # out: (batch_size, ..., K)
         out = torch.matmul(x.reshape(batch_size, -1, self.K), a_t)
 
-        return out.reshape(x.shape[:-1])
+        return out.reshape(*x.shape)
 
     def sample_timesteps(self, bs, device):
         """
-        Uniformly sample timesteps from 0 to num_timesteps-1 for a batch of size bs.
+        Uniformly sample a batch of timesteps.
+
+        Args:
+            bs: Integer batch size.
+            device: Torch device on which to generate the timesteps.
+
+        Returns:
+            Tensor of shape (bs,), containing sampled integer timesteps in [0, T-1].
         """
         return torch.randint(
             low=0, high=self.num_timesteps, size=(bs,), device=device
@@ -212,7 +236,15 @@ class D3PM(nn.Module):
 
     def to_internal_t(self, frac, bs, device):
         """
-        Convert a fraction in [0, 1] to an internal timestep in [0, num_timesteps-1].
+        Convert a scalar fraction in [0, 1] into an internal time index.
+
+        Args:
+            frac: Fractional time tensor or float in [0, 1].
+            bs: Batch size used to expand the converted index.
+            device: Torch device for the generated indices.
+
+        Returns:
+            Tensor of shape (bs,), with integer timesteps in [0, T-1].
         """
         idx = torch.floor(frac * self.num_timesteps).to(torch.int64)
         idx = torch.clamp(idx, min=0, max=self.num_timesteps - 1)
@@ -220,22 +252,29 @@ class D3PM(nn.Module):
 
     def q_probs(self, x_start, t):
         """
-        Compute q(x_t | x_start) for a batch of x_start and t.
-        Inputs:
-            x_start: (batch_size, ...)
-            t: (batch_size,)
-        Returns: (batch_size, ..., K)
+        Compute the forward noising distribution q(x_t | x_start).
+
+        Args:
+            x_start: Initial state tensor of shape (batch_size, ...), each index in [0, K-1].
+            t: Integer timestep tensor of shape (batch_size,).
+
+        Returns:
+            Tensor of shape (batch_size, ..., K), where the last dimension stores the
+            categorical distribution over states at timestep t conditioned on x_start.
         """
         return self._at(self.q_bar_mats, t, x_start)
 
     def q_sample(self, x_start, t, noise):
         """
-        Sample from q(x_t | x_start) for a batch of x_start and t. Add noise to the data.
-        Inputs:
-            x_start: (batch_size, ...)
-            t: (batch_size,)
-            noise: (batch_size, ..., K), where each noise element is a independent uniform random variable in [0, 1].
-        Returns: (batch_size, ...)
+        Sample a noisy state x_t from q(x_t | x_start) using the Gumbel-max trick.
+
+        Args:
+            x_start: Clean state tensor of shape (batch_size, ...), values in [0, K-1].
+            t: Integer timestep tensor of shape (batch_size,).
+            noise: Uniform noise tensor of shape (batch_size, ..., K), in [0, 1].
+
+        Returns:
+            Tensor of shape (batch_size, ...), representing the sampled noisy states at timestep t.
         """
         assert noise.shape == (*x_start.shape, self.K)
 
@@ -246,11 +285,14 @@ class D3PM(nn.Module):
 
     def _get_logits_from_logistic_pars(self, loc, log_scale):
         """
-        Convert logistic distribution parameters to logits.
-        Inputs:
-            loc: (batch_size, ...)
-            log_scale: (batch_size, ...)
-        Returns: (batch_size, ..., K)
+        Convert loc/log_scale parameters of a discretized logistic model into categorical logits.
+
+        Args:
+            loc: Tensor of shape (batch_size, ...), representing the logistic centers.
+            log_scale: Tensor of shape (batch_size, ...), representing log-standard-deviation.
+
+        Returns:
+            Tensor of shape (batch_size, ..., K) of logits for each discrete state.
         """
 
         # (batch_size, ...) -> (batch_size, ..., 1)
@@ -273,13 +315,17 @@ class D3PM(nn.Module):
 
     def q_posterior_logits(self, x_start, x_t, t, is_x_start_logits):
         """
-        Compute the logits of q(x_{t-1} | x_t, x_start) for a batch of x_start, x_t, and t.
-        Inputs:
-            x_start: (batch_size, ...) or (batch_size, ..., K) if is_x_start_logits is True
-            x_t: (batch_size, ...)
-            t: (batch_size,)
-            is_x_start_logits: bool, whether x_start is in logits space or not.
-        Returns: (batch_size, ..., K)
+        Compute the posterior logits q(x_{t-1} | x_t, x_start).
+
+        Args:
+            x_start: Tensor of shape (batch_size, ...) or (batch_size, ..., K) when
+                is_x_start_logits=True.
+            x_t: Noisy state tensor of shape (batch_size, ...).
+            t: Integer timestep tensor of shape (batch_size,).
+            is_x_start_logits: Whether x_start is provided in logits space instead of state-index space.
+
+        Returns:
+            Tensor of shape (batch_size, ..., K) containing posterior logits.
         """
 
         if is_x_start_logits:
@@ -317,10 +363,21 @@ class D3PM(nn.Module):
         )
         return torch.where(t_broadcast == 0, tzero_logits, out)
 
-    def model_x_start_logits(self, model, x, t):
+    def model_x_start_logits(self, model, x, t, model_kwargs=None):
+        """
+        Predict the clean-state logits from the denoising network.
+
+        Args:
+            model: The denoising model, usually taking (x, t) and returning logits or logistic parameters.
+            x: Input state tensor of shape (batch_size, ...).
+            t: Integer timestep tensor of shape (batch_size,).
+
+        Returns:
+            Tensor of shape (batch_size, ..., K) representing the predicted clean-state logits.
+        """
         assert t.shape == (x.shape[0],)
 
-        model_output = model(x, t)
+        model_output = model(x, t, **(model_kwargs or {}))
         if self.logits_type == "logits":
             return model_output
         elif self.logits_type == "logistic_pars":
@@ -331,16 +388,24 @@ class D3PM(nn.Module):
                 f"Unknown logits_type: {self.logits_type}. Must be 'logits' or 'logistic_pars'."
             )
 
-    def p_logits(self, model, *, x, t):
+    def p_logits(self, model, *, x, t, model_kwargs=None):
         """
-        Compute the logits of p_(theta)(x_{t-1} | x_t) for a batch of x and t.
-        Inputs:
-            model: the model to compute p(x_{t-1} | x_t)
-            x: (batch_size, ...)
-            t: (batch_size,)
-        Returns: (batch_size, ..., K)
+        Compute the model posterior logits p_theta(x_{t-1} | x_t).
+
+        Args:
+            model: Denoising network used to predict the clean state distribution.
+            x: Noisy state tensor of shape (batch_size, ...).
+            t: Integer timestep tensor of shape (batch_size,).
+
+        Returns:
+            A tuple (model_logits, pred_x_start_logits), each shaped (batch_size, ..., K).
+            model_logits is the posterior distribution over x_{t-1} after applying the
+            one-step posterior correction, while pred_x_start_logits is the direct prediction
+            of the clean state logits before the posterior correction.
         """
-        model_logits = self.model_x_start_logits(model, x, t)
+        # Register and dimension update for the denoising model output.
+        # model_logits: (batch_size, ..., K), pred_x_start_logits: (batch_size, ..., K)
+        model_logits = self.model_x_start_logits(model, x, t, model_kwargs)
 
         if self.model_prediction_type == "x_start":
             pred_x_start_logits = model_logits
@@ -378,8 +443,13 @@ class D3PM(nn.Module):
     def cum_transition_matrix(self, s, t):
         """
         Compute the cumulative transition matrix from timestep s to timestep t.
-        q(x_t | x_s) = Q_(s+1) @ Q_(s+2) @ ... @ Q_t
-                     = Q_bar_t @ Q_bar_s^{-1}
+
+        Args:
+            s: Start timestep index, where -1 means the initial state distribution.
+            t: End timestep index, with s < t < T.
+
+        Returns:
+            Tensor of shape (K, K) representing the cumulative matrix q(x_t | x_s).
         """
         assert -1 <= s < t < self.num_timesteps, (
             f"Invalid timesteps: s={s}, t={t}, num_timesteps={self.num_timesteps}"
@@ -394,13 +464,23 @@ class D3PM(nn.Module):
         return mat
 
     def q_posterior_logits_strided(self, x_start_logits, x_t, t, s):
-        """
+        r"""
         Compute the logits of q(x_s | x_t, x_start) for an arbitrary jump s < t.
-        q(x_s | x_t, x_start) = q(x_s, x_t, | x_start) / q(x_t | x_start)
+
+        The derivation is:
+            q(x_s | x_t, x_start) = q(x_s, x_t | x_start) / q(x_t | x_start)
                 = q(x_t | x_s, x_start) * q(x_s | x_start) / q(x_t | x_start)
-                = q(x_t | x_s) * q(x_s | x_start) / q(x_t | x_start)
                 \propto q(x_t | x_s) * q(x_s | x_start)
-                = Q_(s->t) (x_s, x_t) * QBar_s (x_start, x_s)
+                = Q_(s->t)(x_s, x_t) * QBar_s(x_start, x_s)
+
+        Args:
+            x_start_logits: Predicted clean-state logits of shape (batch_size, ..., K).
+            x_t: Current noisy state tensor of shape (batch_size, ...).
+            t: Current timestep index, integer tensor of shape (batch_size,).
+            s: Target previous timestep index, with s < t.
+
+        Returns:
+            Tensor of shape (batch_size, ..., K) containing the strided posterior logits.
         """
         assert -1 <= s < t < self.num_timesteps, (
             f"Invalid timesteps: s={s}, t={t}, num_timesteps={self.num_timesteps}"
@@ -423,12 +503,19 @@ class D3PM(nn.Module):
     def prior_sample(self, shape, device):
         """
         Draw x_T from the stationary distribution of the forward process.
+
+        Args:
+            shape: Tuple describing the sample shape, e.g. (batch_size, ...).
+            device: Torch device used to allocate the sampled state tensor.
+
+        Returns:
+            Integer tensor of shape `shape` with state values in [0, K-1].
         """
 
         if self.transition_matrix_type in ["gaussian", "uniform"]:
             return torch.randint(
                 low=0,
-                high=self.num_timesteps,
+                high=self.K,
                 size=shape,
                 dtype=torch.int64,
                 device=device,
@@ -442,8 +529,15 @@ class D3PM(nn.Module):
 
     def forward_jump(self, x_s, s, t):
         """
-        Inputs:
-          x_s: (batch_size, ...) integer state at time s
+        Sample a forward jump from x_s at time s to time t using the cached transition matrix.
+
+        Args:
+            x_s: Integer state tensor of shape (batch_size, ...), values in [0, K-1].
+            s: Current timestep index.
+            t: Target timestep index, where t > s.
+
+        Returns:
+            Tensor of shape (batch_size, ...) containing sampled states at time t.
         """
         assert s < t
         mat = self.q_bar_mats[t] if s < 0 else self.cum_transition_matrix(s, t)
@@ -453,22 +547,33 @@ class D3PM(nn.Module):
         return gumbel_argmax(torch.log(probs + self.eps))
 
     @torch.no_grad()
-    def p_sample(self, model, *, x, t, noise):
+    def p_sample(self, model, *, x, t, noise, model_kwargs=None):
         """
-        Sample one step from the model p(x_(t-1) | x_t).
+        Sample one step from the model p(x_{t-1} | x_t).
 
-        x_t -> model -> p(x_start | x_t) -> p(x_(t-1) | x_t) -> sample x_(t-1)
+        x_t -> model -> p(x_start | x_t) -> p(x_{t-1} | x_t) -> sample x_{t-1}
 
-        Inputs:
-          x: (bs, ...)
-          t: (bs)
-          noise: (bs, ..., K) in U[0, 1] for Gumbel-max
-        Outputs:
-          sample: (bs, ...)
-          pred_x_start_probs: (bs, ..., K)
+        Args:
+            model: Denoising network used for the reverse transition.
+            x: Noisy state tensor of shape (batch_size, ...).
+            t: Integer timestep tensor of shape (batch_size,).
+            noise: Uniform noise tensor of shape (batch_size, ..., K) in [0, 1].
+
+        Returns:
+            A tuple (sample, pred_x_start_probs), where sample has shape (batch_size, ...)
+            and pred_x_start_probs has shape (batch_size, ..., K).
         """
 
-        model_logits, pred_x_start_logits = self.p_logits(model=model, x=x, t=1)
+        # Register and dimension update for the one-step reverse transition.
+        # model_logits: (batch_size, ..., K), pred_x_start_logits: (batch_size, ..., K)
+        if model_kwargs is None:
+            model_logits, pred_x_start_logits = self.p_logits(
+                model=model, x=x, t=t
+            )
+        else:
+            model_logits, pred_x_start_logits = self.p_logits(
+                model=model, x=x, t=t, model_kwargs=model_kwargs
+            )
         assert noise.shape == model_logits.shape
 
         # (bs) -> (bs, 1, ..., 1), dim = (1 + len(x.shape))
@@ -488,7 +593,10 @@ class D3PM(nn.Module):
         return sample, F.softmax(pred_x_start_logits, dim=-1)
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, num_timesteps=None, return_x_T=False):
+    def p_sample_loop(
+        self, model, shape, num_timesteps=None, return_x_T=False,
+        model_kwargs=None,
+    ):
         device = next(model.parameters()).device
         noise_shape = tuple(shape) + (self.K,)
         x_T = self.prior_sample(tuple(shape), device)
@@ -503,6 +611,7 @@ class D3PM(nn.Module):
                 x=x,
                 t=t,
                 noise=torch.rand(size=noise_shape).to(x.device),
+                model_kwargs=model_kwargs,
             )
 
         assert x.shape == shape
@@ -523,6 +632,7 @@ class D3PM(nn.Module):
         return_intermediates=False,
         resample_r=1,
         resample_jump=1.0,
+        model_kwargs=None,
     ):
         if device is None:
             device = next(model.parameters()).device
@@ -547,7 +657,7 @@ class D3PM(nn.Module):
                     (shape[0],), t_now, dtype=torch.int64, device=device
                 )
                 pred_x_start_logits = self.model_x_start_logits(
-                    model, x, t_batch
+                    model, x, t_batch, model_kwargs
                 )
                 nfe += 1
                 # q(x_tnext | x_tnow, x_start)
@@ -576,7 +686,7 @@ class D3PM(nn.Module):
         return (x, intermediates) if return_intermediates else x
 
     # ====== Log Likelihood / Loss Calculation ======
-    def vb_terms_bpd(self, model, *, x_start, x_t, t):
+    def vb_terms_bpd(self, model, *, x_start, x_t, t, model_kwargs=None):
         """Calculate specified terms of the variational bound.
 
         Args:
@@ -593,10 +703,12 @@ class D3PM(nn.Module):
         """
         # The logits of q(x_{t-1} | x_t, x_start)
         true_logits = self.q_posterior_logits(
-            x_start, x_t, t, x_start_logits=False
+            x_start, x_t, t, is_x_start_logits=False
         )
         # The logits of p_(theta)(x_{t-1} | x_t)
-        model_logits, pred_x_start_logits = self.p_logits(model, x=x_t, t=t)
+        model_logits, pred_x_start_logits = self.p_logits(
+            model, x=x_t, t=t, model_kwargs=model_kwargs
+        )
 
         kl = categorical_kl_logits(logits1=true_logits, logits2=model_logits)
         assert kl.shape == x_start.shape
@@ -656,7 +768,7 @@ class D3PM(nn.Module):
         ce = meanflat(ce) / np.log(2.0)
         return ce
 
-    def training_losses(self, model, x_start, t):
+    def training_losses(self, model, x_start, t, model_kwargs=None):
         noise = torch.rand(
             size=x_start.shape + (self.K,), device=x_start.device
         )
@@ -666,17 +778,21 @@ class D3PM(nn.Module):
 
         if self.loss_type == "kl":
             losses, _ = self.vb_terms_bpd(
-                model=model, x_start=x_start, x_t=x_t, t=t
+                model=model, x_start=x_start, x_t=x_t, t=t,
+                model_kwargs=model_kwargs,
             )
 
         elif self.loss_type == "cross_entropy_x_start":
-            _, pred_x_start_logtits = self.p_logits(model=model, x_t=x_t, t=t)
+            _, pred_x_start_logtits = self.p_logits(
+                model=model, x=x_t, t=t, model_kwargs=model_kwargs
+            )
             losses = self.cross_entropy_x_start(
                 x_start=x_start, pred_x_start_logits=pred_x_start_logtits
             )
         elif self.loss_type == "hybrid":
             vb_losses, pred_x_start_logtits = self.vb_terms_bpd(
-                model=model, x_start=x_start, x_t=x_t, t=t
+                model=model, x_start=x_start, x_t=x_t, t=t,
+                model_kwargs=model_kwargs,
             )
             ce_losses = self.cross_entropy_x_start(
                 x_start=x_start, pred_x_start_logits=pred_x_start_logtits

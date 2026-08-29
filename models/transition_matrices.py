@@ -10,6 +10,19 @@ def compute_transition_matrices(
     transition_bands=None,
     mask_id=None,
 ):
+    """
+    Build the full forward transition tensor for every diffusion timestep.
+
+    Args:
+        betas: Tensor or array-like of shape (T,) storing the per-timestep diffusion rates.
+        transition_matrix_type: One of {"uniform", "gaussian", "absorbing"}.
+        K: Number of discrete states.
+        transition_bands: Optional local-band width for structured kernels.
+        mask_id: Absorbing state index required when using the absorbing kernel.
+
+    Returns:
+        Tensor of shape (T, K, K), where each matrix Q_t defines q(x_t | x_{t-1}).
+    """
     if transition_matrix_type == "uniform":
         q_mats = [
             get_uniform_transition_matrix(betas, t, K, transition_bands)
@@ -37,7 +50,19 @@ def compute_transition_matrices(
 
 
 def get_uniform_transition_matrix(betas, t, K, transition_bands=None):
-    beta_t = betas[t].numpy()
+    """
+    Construct the uniform discrete diffusion matrix at timestep t.
+
+    Args:
+        betas: Tensor of shape (T,) containing diffusion coefficients.
+        t: Integer timestep index.
+        K: Number of discrete states.
+        transition_bands: Optional local neighborhood size for the transition band.
+
+    Returns:
+        Tensor of shape (K, K) representing the uniform transition kernel.
+    """
+    beta_t = betas[t].detach().cpu().item()
 
     if transition_bands is None:
         mat = np.full(
@@ -67,7 +92,19 @@ def get_uniform_transition_matrix(betas, t, K, transition_bands=None):
 
 
 def get_gaussian_transition_matrix(betas, t, K, transition_bands=None):
-    beta_t = betas[t].numpy()
+    """
+    Construct the Gaussian-like discrete diffusion matrix at timestep t.
+
+    Args:
+        betas: Tensor of shape (T,) containing diffusion coefficients.
+        t: Integer timestep index.
+        K: Number of discrete states.
+        transition_bands: Optional number of nearby states to include in the kernel.
+
+    Returns:
+        Tensor of shape (K, K) representing the Gaussian-style transition kernel.
+    """
+    beta_t = betas[t].detach().cpu().item()
     transition_bands = (
         transition_bands if transition_bands is not None else K - 1
     )
@@ -96,7 +133,19 @@ def get_gaussian_transition_matrix(betas, t, K, transition_bands=None):
 
 
 def get_absorbing_transition_matrix(betas, t, K, mask_id):
-    beta_t = betas[t].numpy()
+    """
+    Construct the absorbing-state transition matrix at timestep t.
+
+    Args:
+        betas: Tensor of shape (T,) containing diffusion coefficients.
+        t: Integer timestep index.
+        K: Number of discrete states.
+        mask_id: Absorbing state index.
+
+    Returns:
+        Tensor of shape (K, K) representing the absorbing-state kernel.
+    """
+    beta_t = betas[t].detach().cpu().item()
     diag = np.full(shape=(K), fill_value=1.0 - beta_t, dtype=np.float64)
     mat = np.diag(diag, k=0)
     mat[:, mask_id] += beta_t
