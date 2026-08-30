@@ -161,6 +161,70 @@ def evaluate_swiss(samples, sample_labels, reference, reference_labels, bounds, 
     return float(np.mean(scores))
 
 
+@torch.no_grad()
+def sample_in_batches(d3pm, model, sample_labels, data_shape, batch_size, cfg_scale=1.0):
+    """Draw conditional samples in memory-bounded batches.
+
+    Args:
+        d3pm: Diffusion process used for reverse sampling.
+        model: Denoising model.
+        sample_labels: Integer condition tensor of shape ``(N,)``.
+        data_shape: Non-batch state dimensions, e.g. ``(28, 28)``.
+        batch_size: Maximum number of images sampled in one reverse loop.
+        cfg_scale: Classifier-free guidance scale passed to the DiT.
+
+    Returns:
+        Integer tensor of shape ``(N, *data_shape)`` in the original label order.
+    """
+    if batch_size < 1:
+        raise ValueError("sample batch_size must be at least 1.")
+    batches = []
+    for start in range(0, len(sample_labels), batch_size):
+        labels = sample_labels[start:start + batch_size]
+        batches.append(d3pm.p_sample_loop(
+            model,
+            (len(labels), *data_shape),
+            model_kwargs={"y": labels, "cfg_scale": cfg_scale},
+        ))
+    return torch.cat(batches, dim=0)
+
+
+def save_checkpoint(path, model, optimizer, step, betas, transition, seed, args):
+    """Persist training state so completed updates survive sampling failures.
+
+    Args:
+        path: Checkpoint destination path.
+        model: DiT denoiser whose parameters are saved.
+        optimizer: Optimizer whose state is saved for possible future resume support.
+        step: Number of completed optimizer updates.
+        betas: Calibrated schedule tensor of shape ``(T,)``.
+        transition: Transition-kernel name.
+        seed: Run random seed.
+        args: Parsed experiment configuration.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "betas": betas.cpu(),
+            "transition": transition,
+            "seed": seed,
+            "K": args.K,
+            "timesteps": args.timesteps,
+            "input_shape": model.input_shape,
+            "hidden_size": model.token_embed.embedding_dim,
+            "depth": len(model.blocks),
+            "num_heads": model.blocks[0].attn.num_heads,
+            "condition_classes": model.condition_classes,
+            "transition_bands": args.transition_bands,
+            "hybrid_coeff": args.hybrid_coeff,
+        },
+        path,
+    )
+
+
 def run_one(args, transition, train_data, swiss_bounds, swiss_reference, seed):
     """Train one baseline, logging loss curves, and return its final mean loss.
 
@@ -189,6 +253,9 @@ def run_one(args, transition, train_data, swiss_bounds, swiss_reference, seed):
         condition_classes=labels,
     ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    checkpoint_path = (
+        Path(args.checkpoint_dir) / args.dataset / f"{transition}_seed{seed}.pt"
+    )
     loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, drop_last=True)
     iterator = iter(loader)
     losses = []
@@ -220,6 +287,13 @@ def run_one(args, transition, train_data, swiss_bounds, swiss_reference, seed):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if (
+            (args.checkpoint_every > 0 and step % args.checkpoint_every == 0)
+            or step == args.steps
+        ):
+            save_checkpoint(
+                checkpoint_path, model, optimizer, step, betas, transition, seed, args
+            )
         losses.append(loss.item())
         writer.add_scalar("train/loss_bits", loss.item(), step)
         writer.add_scalar("train/loss_bits_window", np.mean(losses[-args.log_every:]), step)
@@ -228,9 +302,27 @@ def run_one(args, transition, train_data, swiss_bounds, swiss_reference, seed):
             print(f"{transition} step={step:6d} loss={np.mean(losses[-args.log_every:]):.4f}", flush=True)
     model.eval()
     sample_labels = torch.arange(labels, device=device).repeat_interleave(args.samples_per_class)
-    samples = d3pm.p_sample_loop(model, (len(sample_labels), *data_shape), model_kwargs={"y": sample_labels})
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    samples = sample_in_batches(
+        d3pm, model, sample_labels, data_shape, args.sample_batch_size,
+        args.cfg_scale,
+    )
     output = Path(args.output_dir) / args.dataset / f"{transition}_seed{seed}.png"
     save_samples(samples, args.dataset, output, transition, args.K, swiss_bounds)
+    sample_tensor_path = None
+    if args.dataset == "mnist":
+        sample_tensor_path = output.with_suffix(".pt")
+        torch.save(
+            {
+                "samples": samples.cpu(),
+                "labels": sample_labels.cpu(),
+                "K": args.K,
+                "transition": transition,
+                "seed": seed,
+            },
+            sample_tensor_path,
+        )
     final_loss = float(np.mean(losses[-min(len(losses), args.log_every):]))
     writer.add_scalar("train/final_loss_bits", final_loss, args.steps)
     writer.add_scalar("schedule/terminal_total_variation", terminal_tv, 0)
@@ -242,12 +334,15 @@ def run_one(args, transition, train_data, swiss_bounds, swiss_reference, seed):
         "terminal_tv": terminal_tv,
         "beta_end": float(betas[-1]),
         "samples": str(output),
+        "checkpoint": str(checkpoint_path),
     }
     if args.dataset == "swiss":
         result["conditional_swd"] = evaluate_swiss(
             samples, sample_labels.cpu().numpy(), *swiss_reference, swiss_bounds,
             args.K, seed,
         )
+    else:
+        result["generated_samples"] = str(sample_tensor_path)
     return result
 
 
@@ -255,6 +350,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=("swiss", "mnist"), required=True)
     parser.add_argument("--output-dir", default="artifacts/transition_comparison")
+    parser.add_argument("--checkpoint-dir", default="artifacts/checkpoints")
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=5_000,
+        help="Checkpoint interval in updates; use 0 to save only the final model.",
+    )
+    parser.add_argument(
+        "--skip-existing-checkpoints", action="store_true",
+        help="Skip a transition/seed pair when its final checkpoint already exists.",
+    )
     parser.add_argument(
         "--tensorboard-dir",
         default="artifacts/tensorboard",
@@ -273,6 +377,14 @@ def parse_args():
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--samples-per-class", type=int, default=300)
+    parser.add_argument(
+        "--sample-batch-size", type=int, default=32,
+        help="Maximum reverse-sampling batch size; lower this if CUDA OOM persists.",
+    )
+    parser.add_argument(
+        "--cfg-scale", type=float, default=1.0,
+        help="Classifier-free guidance scale used only during conditional sampling.",
+    )
     parser.add_argument("--swiss-samples", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeds", type=int, nargs="+", default=None)
@@ -307,9 +419,18 @@ def main():
     results = []
     for seed in (args.seeds or [args.seed]):
         for transition in args.transitions:
+            checkpoint_path = (
+                Path(args.checkpoint_dir) / args.dataset / f"{transition}_seed{seed}.pt"
+            )
+            if args.skip_existing_checkpoints and checkpoint_path.exists():
+                print(f"Skipping existing checkpoint: {checkpoint_path}", flush=True)
+                continue
             results.append(run_one(
                 args, transition, train_data, swiss_bounds, swiss_reference, seed
             ))
+    if not results:
+        print("No runs executed; all requested checkpoints already exist.")
+        return
     summary = Path(args.output_dir) / args.dataset / "summary.csv"
     summary.parent.mkdir(parents=True, exist_ok=True)
     with summary.open("w", newline="") as f:

@@ -1,4 +1,4 @@
-# d3pm
+#  Discrete Denoising Diffusion Probabilistic Models (D3PM)
 
 ## Fair 2-D Swiss-roll transition comparison
 
@@ -99,6 +99,57 @@ supporting evidence, while the table above is the quantitative comparison.
 Raw per-seed results and generated samples are stored under
 `artifacts/swiss_fair/seed{0,1,2}/swiss/`. TensorBoard logs are under
 `artifacts/tensorboard/swiss_fair/`.
+
+## MNIST conditional-generation evaluation
+
+MNIST samples should not be ranked by D3PM training loss alone. Keep training
+jobs short and robust by generating only a small visual grid at their end:
+
+```bash
+python -m experiments.run_transition_comparison \
+  --dataset mnist --device cuda --seeds 0 1 2 --steps 30000 \
+  --batch-size 64 --timesteps 100 --K 32 \
+  --hidden-size 96 --depth 4 --heads 4 \
+  --samples-per-class 10 --sample-batch-size 32 --checkpoint-every 0
+```
+
+The final checkpoint can then be sampled independently at the larger evaluation
+count, so a long sampling phase cannot discard an already trained model:
+
+```bash
+python -m experiments.sample_mnist_checkpoint \
+  --checkpoint artifacts/checkpoints/mnist/uniform_seed0.pt \
+  --device cuda --samples-per-class 1000 --sample-batch-size 32 \
+  --cfg-scale 1.5 \
+  --output-dir artifacts/mnist_comparison/mnist
+```
+
+This writes a `.pt` file containing quantized samples, requested digit labels,
+`K`, transition name, and seed. Train a reference classifier on MNIST quantized
+to that same `K`, then evaluate whether generated images are recognized as their
+requested labels:
+
+The DiT is trained with 10% class-label dropout and supports classifier-free
+guidance (CFG) during sampling. `--cfg-scale 1.0` reproduces ordinary conditional
+sampling, `0.0` uses the null-label prediction, and values above one strengthen
+label adherence at the cost of diversity and roughly twice the denoiser compute.
+Evaluate a small sweep such as `1.0`, `1.5`, and `2.0` with the classifier rather
+than assuming one scale is optimal.
+
+```bash
+python experiments/evaluate_mnist_classifier.py \
+  --device cuda --K 32 \
+  --sample-files artifacts/mnist_comparison/mnist/uniform_seed0.pt \
+                 artifacts/mnist_comparison/mnist/gaussian_seed0.pt \
+                 artifacts/mnist_comparison/mnist/absorbing_seed0.pt \
+  --output artifacts/mnist_comparison/classifier_eval.json
+```
+
+On its first invocation the evaluator trains and saves a classifier checkpoint.
+It reports the classifier's test accuracy (verify it is high before trusting the
+metric), overall requested-label accuracy, mean probability assigned to the
+requested label, and the same two values for every digit class. The JSON retains
+per-class results; the adjacent CSV provides one aggregate row per sample file.
 
 
 ## References

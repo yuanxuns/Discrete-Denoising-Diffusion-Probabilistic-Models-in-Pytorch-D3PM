@@ -93,21 +93,17 @@ class DiT(nn.Module):
         self.head = nn.Linear(hidden_size, num_classes)
         nn.init.normal_(self.position_embed, std=0.02)
 
-    def forward(self, x, t, y=None):
-        """Predict clean categorical logits.
+    def _forward_logits(self, x, t, y):
+        """Predict logits for one fixed conditioning assignment.
 
         Args:
             x: Integer noisy-state tensor of shape ``(B, *input_shape)``.
             t: Integer timestep tensor of shape ``(B,)`` in ``[0, T-1]``.
-            y: Optional class-label tensor of shape ``(B,)``.
+            y: Class-label tensor of shape ``(B,)`` or ``None``.
 
         Returns:
             Tensor of shape ``(B, *input_shape, K)``.
         """
-        if tuple(x.shape[1:]) != self.input_shape:
-            raise ValueError(f"Expected x.shape[1:]={self.input_shape}, got {tuple(x.shape[1:])}.")
-        if t.shape != (x.shape[0],):
-            raise ValueError("t must have shape (batch_size,).")
         tokens = self.token_embed(x.long().reshape(x.shape[0], self.num_tokens))
         cond = self.time_embed(t.long())
         if self.class_embed is not None:
@@ -125,3 +121,30 @@ class DiT(nn.Module):
             h = block(h, cond)
         logits = self.head(self.norm(h))
         return logits.reshape(x.shape[0], *self.input_shape, self.num_classes)
+
+    def forward(self, x, t, y=None, cfg_scale=1.0):
+        """Predict clean categorical logits, optionally with CFG at inference.
+
+        Args:
+            x: Integer noisy-state tensor of shape ``(B, *input_shape)``.
+            t: Integer timestep tensor of shape ``(B,)`` in ``[0, T-1]``.
+            y: Optional class-label tensor of shape ``(B,)``.
+            cfg_scale: Classifier-free guidance scale. ``1.0`` uses ordinary
+                conditional logits; ``0.0`` uses null-label logits; values above
+                one strengthen the conditional prediction. It is ignored for an
+                unconditional model or when ``y`` is ``None``.
+
+        Returns:
+            Tensor of shape ``(B, *input_shape, K)``.
+        """
+        if tuple(x.shape[1:]) != self.input_shape:
+            raise ValueError(f"Expected x.shape[1:]={self.input_shape}, got {tuple(x.shape[1:])}.")
+        if t.shape != (x.shape[0],):
+            raise ValueError("t must have shape (batch_size,).")
+        if self.class_embed is None or y is None or cfg_scale == 1.0:
+            return self._forward_logits(x, t, y)
+        conditional_logits = self._forward_logits(x, t, y)
+        unconditional_logits = self._forward_logits(x, t, None)
+        return unconditional_logits + cfg_scale * (
+            conditional_logits - unconditional_logits
+        )
