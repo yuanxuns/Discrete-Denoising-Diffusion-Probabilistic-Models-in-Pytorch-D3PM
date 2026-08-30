@@ -151,6 +151,41 @@ metric), overall requested-label accuracy, mean probability assigned to the
 requested label, and the same two values for every digit class. The JSON retains
 per-class results; the adjacent CSV provides one aggregate row per sample file.
 
+### Completed 30k-step comparison
+
+The following baseline used `K=32`, `T=100`, the same conditional DiT
+(`hidden_size=96`, depth 4, 4 heads), batch size 64, 30,000 updates, and three
+training seeds. Each transition used a separately calibrated linear schedule
+with terminal TV distance `0.005`; only the forward transition differs. The
+reported samples use ordinary conditional sampling (`cfg_scale=1.0`).
+
+The reference classifier was trained on MNIST quantized with the same `K=32`
+and reached 99.2% test accuracy. For a size-matched comparison, every run was
+evaluated on 10 requested samples per digit (100 per seed). Error bars are the
+sample standard deviation over three training seeds.
+
+| Transition | Beta endpoint | Final train loss (bits) ↓ | Requested-label accuracy ↑ | Mean requested-label probability ↑ |
+| --- | ---: | ---: | ---: | ---: |
+| uniform | 0.10159 | 0.00721 ± 0.00024 | 0.857 ± 0.032 | 0.852 ± 0.023 |
+| gaussian | 0.17083 | 0.00738 ± 0.00039 | 0.787 ± 0.040 | 0.771 ± 0.037 |
+| absorbing | 0.10217 | **0.00642 ± 0.00009** | **0.883 ± 0.031** | **0.871 ± 0.036** |
+
+![MNIST transition comparison: requested-label accuracy and probability](docs/images/mnist-transition-comparison.png)
+
+For this fixed-budget benchmark, the absorbing transition is the strongest:
+it has the lowest training loss and the best conditional adherence. Its mean
+requested-label accuracy is 2.7 percentage points above uniform and 9.7 points
+above gaussian. Uniform is consistently second, while gaussian needs a larger
+beta endpoint to reach the same terminal-mixing target and performs worst here.
+
+This is a comparison of conditional recognizability, not a complete image-quality
+claim: the classifier metric does not directly measure diversity, realism, or
+intra-class coverage. The 100 samples per seed also make this a compact
+evaluation; a stronger report should add more evaluation samples, FID/KID-like
+feature distances, and a CFG-scale sweep. The raw evaluation data is in
+`artifacts/transition_comparison/mnist/classifier_eval_equal_n100.json`, and the
+plot can be regenerated with `experiments/plot_mnist_classifier_results.py`.
+
 
 ## References
 
